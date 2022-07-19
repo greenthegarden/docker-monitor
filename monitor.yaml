@@ -22,6 +22,11 @@
     #   tags:
     #     - always
 
+    # https://grafana.com/docs/loki/latest/clients/docker-driver/
+    - name: Install docker driver
+      ansible.builtin.command: docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions
+      register: docker_driver_loki
+
     - name: Run message
       ansible.builtin.debug:
         msg: "Running on host {{ ansible_hostname }} via {{ ansible_default_ipv4.interface }} @ {{ ansible_default_ipv4.address }} as user {{ ansible_user_id }}"
@@ -110,6 +115,75 @@
 
       when: not node_exporter_state.exists
 
+    ####### LOKI SECTION
+
+    # Source: https://grafana.com/docs/loki/latest/installation/docker/
+
+    - name: Set Loki facts
+      ansible.builtin.set_fact:
+        loki_image_name: grafana/loki
+        loki_image_tag: main # 2.5.2
+        loki_container_name: loki
+        loki_container_port: 3100
+        loki_volume: loki-volume
+      tags:
+        - loki
+
+    - name: Check if Loki is running
+      community.docker.docker_container_info:
+        name: "{{ loki_container_name }}"
+      register: loki_state
+      
+    - block:
+    
+      - name: Pull Loki image
+        community.docker.docker_image:
+          name: "{{ loki_image_name }}:{{ loki_image_tag | default('latest') }}"
+          source: pull
+        tags:
+          - loki
+
+      - name: Start Loki
+        community.docker.docker_container:
+          name: "{{ loki_container_name }}"
+          image: "{{ loki_image_name }}:{{ loki_image_tag | default('latest') }}"
+          # command: --config.file=/mnt/config/loki-config.yaml
+          detach: true
+          networks_cli_compatible: true
+          networks:
+            - name: "{{ monitoring_network_name }}"
+          published_ports:
+            - "{{ loki_container_port }}:3100"
+          restart: true
+          restart_policy: unless-stopped
+          state: started
+          volumes:
+            # - "{{ loki_config_dir }}:/mnt/config"
+            - /etc/localtime:/etc/localtime:ro
+        register: loki_register
+        tags:
+          - loki
+
+      - name: Wait for Loki to accept connections
+        ansible.builtin.wait_for:
+          # host: "{{ loki_register['container']\
+          #   ['NetworkSettings']\
+          #   ['Networks']\
+          #   ['monitoring-network']\
+          #   ['IPAddress'] }}"
+          host: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
+          port: "{{ loki_container_port | default(3100) }}"
+          connect_timeout: 1
+          delay: 10
+          state: started
+          timeout: 30
+        register: loki_running
+        until: loki_running is success
+        retries: 10
+        tags:
+          - loki
+
+      when: not loki_state.exists
 
     ####### PROMETHEUS SECTION
 
@@ -200,119 +274,17 @@
 
     - name: Copy configuration file into Prometheus container
       ansible.builtin.shell: docker cp files/prometheus/prometheus.yml {{ prometheus_container_name }}:/etc/prometheus/prometheus.yml
-
-    # - name: Restart Prometheus
-    #   community.docker.docker_container_exec:
-    #     container: "{{ prometheus_container_name }}"
-    #     command: /bin/sh -c "/bin/prometheus --config.file=/etc/prometheus/prometheus.yml"
-    #   register: result
+      tags:
+        - prometheus
 
       # curl -X POST :9090/-/reload
     - name: Restart Prometheus via curl
       ansible.builtin.uri:
         url: "http://{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}:9090/-/reload"
         method: POST
-        # body: "{{ lookup('ansible.builtin.file','issue.json') }}"
+      tags:
+        - prometheus
 
-    # ####### LOKI SECTION
-
-    # # Source: https://grafana.com/docs/loki/latest/installation/docker/
-
-    # - name: Set loki facts
-    #   ansible.builtin.set_fact:
-    #     loki_image_name: grafana/loki
-    #     loki_image_tag: 2.5.2
-    #     loki_container_name: loki
-    #     loki_container_port: 3100
-    #     loki_volume: loki-data
-    #   tags:
-    #     - loki
-    #     - stable
-
-    # - name: Pull image
-    #   community.docker.docker_image:
-    #     name: "{{ loki_image_name }}:{{ loki_image_tag | default('latest') }}"
-    #     source: pull
-    #   tags:
-    #     - loki
-    #     - stable
-
-    # - name: Define configuration directory
-    #   ansible.builtin.set_fact:
-    #     loki_config_dir: "{{ ansible_user_registered.home }}/loki"
-    #   tags:
-    #     - loki
-    #     - stable
-
-    # - name: Create configuration directory
-    #   ansible.builtin.file:
-    #     path: "{{ loki_config_dir }}"
-    #     state: directory
-    #     mode: '0755'
-    #   tags:
-    #     - loki
-    #     - stable
-
-    # - name: Get configuration file
-    #   ansible.builtin.get_url:
-    #     url: https://raw.githubusercontent.com/grafana/loki/v2.5.0/cmd/loki/loki-local-config.yaml
-    #     dest: "{{ loki_config_dir }}/loki-config.yaml"
-    #     mode: '0440'
-    #   tags:
-    #     - loki
-    #     - stable
-
-    # - name: Run loki
-    #   community.docker.docker_container:
-    #     image: "{{ loki_image_name }}:{{ loki_image_tag | default('latest') }}"
-    #     name: "{{ loki_container_name }}"
-    #     command: --config.file=/mnt/config/loki-config.yaml
-    #     detach: true
-    #     dns_servers:
-    #       - "{{ consul_dns_host | default(ansible_host) }}"
-    #       - "{{ lan_dns_host | default('192.168.1.1') }}"
-    #     dns_search_domains:
-    #       - "{{ consul_dns_domain | default('service.dc1.consul') }}"
-    #       - "{{ lan_dns_domain | default('localdomain') }}"
-    #     env:
-    #       CONSUL_HTTP_ADDR: "{{ host_address }}:8500"
-    #       CONSUL_RPC_ADDR: "{{ host_address }}:8400"
-    #     labels:
-    #       traefik.enable: "true"
-    #       traefik.http.services.loki.loadbalancer.server.port: "3100"
-    #       traefik.http.routers.loki.rule: Host(`loki`)
-    #     published_ports:
-    #       - "{{ loki_container_port }}:3100"
-    #     restart: true
-    #     restart_policy: unless-stopped
-    #     state: started
-    #     user: "{{ ansible_user_uid }}:{{ ansible_user_gid }}"
-    #     volumes:
-    #       - "{{ loki_config_dir }}:/mnt/config"
-    #       - /etc/localtime:/etc/localtime:ro
-    #   tags:
-    #     - loki
-    #     - stable
-
-    # - name: Wait for loki to start
-    #   ansible.builtin.wait_for:
-    #     host: "{{ host_address }}"
-    #     port: "{{ loki_container_port }}"
-    #     delay: 10
-    #     state: started
-    #   tags:
-    #     - loki
-    #     - stable
-
-    # - name: Register loki service with the consul agent
-    #   community.general.consul:
-    #     service_name: "{{ loki_container_name }}"
-    #     service_port: "{{ loki_container_port }}"
-    #     host: "{{ host_address }}"
-    #   when: consul_service_running
-    #   tags:
-    #     - loki
-    #     - stable
 
     # ####### PROMTAIL SECTION
 
@@ -440,6 +412,10 @@
           env:
             GF_SECURITY_ADMIN_PASSWORD: "{{ grafana_security.admin_password }}"
             GF_USERS_ALLOW_SIGN_UP: "false"
+          log_driver: loki
+          log_options:
+            loki-url: "http://{{ loki_container_name }}:{{ loki_container_port }}/loki/api/v1/push"
+            loki-external-labels: job=dockerlogs,owner=monitor,environment=development
           networks_cli_compatible: true
           networks:
             - name: "{{ monitoring_network_name }}"
@@ -488,10 +464,6 @@
         ds_url: "{{ item.url }}"
         access: "{{ item.access }}"
         tls_skip_verify: true
-        # additional_json_data:
-        #   httpHeaderName1: "Authorization"
-        # additional_secure_json_data:
-        #   httpHeaderValue1: "Bearer ihavenogroot"
       with_items: "{{ grafana_datasources }}"
       vars:
         grafana_datasources:
@@ -500,11 +472,11 @@
             access: proxy
             url: "http://{{ prometheus_container_name }}:{{ prometheus_container_port }}"
             basicAuth: false
-          # - name: Loki
-          #   type: loki
-          #   access: proxy
-          #   url: "http://192.168.1.186:3100/"
-          #   basicAuth: false
+          - name: Loki
+            type: loki
+            access: proxy
+            url: "http://{{ loki_container_name }}:{{ loki_container_port }}"
+            basicAuth: false
           # - name: InfluxDB
           #   type: influxdb
           #   access: proxy
@@ -523,35 +495,16 @@
         dashboard_url: "https://grafana.com/api/dashboards/{{ item.dashboard_id }}/revisions/{{ item.dashboard_revision }}/download"
       vars:
         grafana_dashboards:
-          # - dashboard_id: '13584'
-          #   dashboard_revision: '1'
-          #   datasource: 'Prometheus'
-          # # DockProm Docker Containers dashboard with support for multiple instance
-          # # https://grafana.com/grafana/dashboards/14479
-          # - dashboard_id: '14479'
-          #   dashboard_revision: '1'
-          #   datasource: 'Prometheus'
-          # # Docker and system monitoring by kulab45
-          # # https://grafana.com/grafana/dashboards/13496
-          # # - dashboard_id: '13496'
-          # #   dashboard_revision: '1'
-          # #   datasource: 'Prometheus'
-          # # Docker Environment Monitoring
-          # # https://grafana.com/grafana/dashboards/12792
-          # - dashboard_id: '12792'
-          #   dashboard_revision: '2'
-          #   datasource: 'Prometheus'
-          # # # Docker and OS metrics ( cadvisor, node_exporter) by Bernardo Martinez
-          # # # https://grafana.com/grafana/dashboards/10566
-          # # - dashboard_id: '10566'
-          # #   dashboard_revision: '1'
-          # #   datasource: 'Prometheus'
           # Node Exporter Full by rfraile
           # https://grafana.com/grafana/dashboards/1860
           - dashboard_id: '1860'
             dashboard_revision: '27'
             datasource: 'Prometheus'
+          # Logs / App by Sadlil
+          # https://grafana.com/grafana/dashboards/13639
+          - dashboard_id: '13639'
+            dashboard_revision: '2'
+            datasource: 'Loki'
       with_items: "{{ grafana_dashboards }}"
       tags:
         - grafana
-        - stable
