@@ -1,0 +1,557 @@
+---
+- name: Configure monitoring services
+
+  hosts: localhost
+
+  vars:
+
+  pre_tasks:
+
+    - name: Check for dependent python modules
+      community.general.python_requirements_info:
+        dependencies:
+          - docker>=5.0.0
+      tags:
+        - always
+
+    # - name: create configuration directory for user
+    #   ansible.builtin.user:
+    #     name: "{{ ansible_user_id }}"
+    #     state: present
+    #   register: ansible_user_registered
+    #   tags:
+    #     - always
+
+    - name: Run message
+      ansible.builtin.debug:
+        msg: "Running on host {{ ansible_hostname }} via {{ ansible_default_ipv4.interface }} @ {{ ansible_default_ipv4.address }} as user {{ ansible_user_id }}"
+      tags:
+        - always
+
+  tasks:
+
+    ####### MONITORING NETWORK SECTION
+
+    # Based on
+    # https://community.home-assistant.io/t/how-to-run-homeassistant-on-docker-on-its-own-network-instead-of-the-host-network/189315/4
+
+    - name: Set Monitoring Network facts
+      ansible.builtin.set_fact:
+        monitoring_network_name: monitoring-network
+
+    - name: Create a Monitoring Network
+      community.docker.docker_network:
+        name: "{{ monitoring_network_name | default('monitoring_network') }}"
+        internal: false
+    
+    ####### NODE EXPORTER SECTION
+
+    - name: Set Node Exporter facts
+      ansible.builtin.set_fact:
+        node_exporter_image_name: prom/node-exporter
+        node_exporter_image_tag: latest
+        node_exporter_container_name: node-exporter
+        node_exporter_container_port: 9100
+      tags:
+        - node-exporter
+
+    - name: Check if Node Exporter is running
+      community.docker.docker_container_info:
+        name: "{{ node_exporter_container_name }}"
+      register: node_exporter_state
+      
+    - block:
+
+      - name: Pull Node Exporter image
+        community.docker.docker_image:
+          name: "{{ node_exporter_image_name }}:{{ node_exporter_image_tag | default('latest') }}"
+          source: pull
+        tags:
+          - node-exporter
+
+      - name: Start Node Exporter
+        community.docker.docker_container:
+          name: "{{ node_exporter_container_name }}"
+          image: "{{ node_exporter_image_name }}:{{ node_exporter_image_tag | default('latest') }}"
+          detach: true
+          networks_cli_compatible: true
+          networks:
+            - name: "{{ monitoring_network_name }}"
+          published_ports:
+            - "{{ node_exporter_container_port }}:9100"
+          restart_policy: unless-stopped
+          state: started
+          volumes:
+            - /proc:/host/proc:ro
+            - /sys/:/host/sys:ro
+            - /:/rootfs:ro
+        register: node_exporter_register
+        tags:
+          - node-exporter
+
+      - name: Wait for Node Exporter to accept connections
+        ansible.builtin.wait_for:
+          # host: "{{ node_exporter_register['container']\
+          #   ['NetworkSettings']\
+          #   ['Networks']\
+          #   ['monitoring-network']\
+          #   ['IPAddress'] }}"
+          host: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
+          port: "{{ node_exporter_container_port | default(9100) }}"
+          connect_timeout: 1
+          delay: 10
+          state: started
+          timeout: 30
+        register: node_exporter_running
+        until: node_exporter_running is success
+        retries: 10
+        tags:
+          - node-exporter
+
+      when: not node_exporter_state.exists
+
+
+    ####### PROMETHEUS SECTION
+
+    # https://hub.docker.com/r/prom/prometheus
+    # https://medium.com/platform-engineering/monitoring-traefik-with-grafana-1d037af5b952
+
+    - name: Set Prometheus facts
+      ansible.builtin.set_fact:
+        prometheus_image_name: prom/prometheus
+        prometheus_image_tag: latest
+        prometheus_container_name: prometheus
+        prometheus_container_port: 9090
+      tags:
+        - prometheus
+
+    - name: Check if Prometheus is running
+      community.docker.docker_container_info:
+        name: "{{ prometheus_container_name }}"
+      register: prometheus_state
+      
+    - block:
+
+      - name: Pull Prometheus image
+        community.docker.docker_image:
+          name: "{{ prometheus_image_name }}:{{prometheus_image_tag | default('latest') }}"
+          source: pull
+        tags:
+          - prometheus
+
+      - name: Start Prometheus
+        community.docker.docker_container:
+          name: "{{ prometheus_container_name | default('prometheus') }}"
+          image: "{{ prometheus_image_name }}:{{ prometheus_image_tag | default('latest') }}"
+          command:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --web.enable-lifecycle
+          detach: true
+          memory: 300M
+          memory_reservation: 100M
+          networks_cli_compatible: true
+          networks:
+            - name: "{{ monitoring_network_name }}"
+          published_ports:
+            - "{{ prometheus_container_port | default(9090) }}:9090"
+          state: started
+          recreate: true
+          restart: true
+          restart_policy: unless-stopped
+          volumes:
+            # - "/home/{{ ansible_user }}/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+            - /etc/localtime:/etc/localtime:ro
+        register: prometheus_register
+        tags:
+          - prometheus
+
+      - name: Wait for Prometheus to accept connections
+        ansible.builtin.wait_for:
+          # host: "{{ prometheus_register['container']\
+          #   ['NetworkSettings']\
+          #   ['Networks']\
+          #   ['monitoring-network']\
+          #   ['IPAddress'] }}"
+          host: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
+          port: "{{ prometheus_container_port | default('9090') }}"
+          connect_timeout: 1
+          delay: 10
+          state: started
+          timeout: 30
+        register: prometheus_running
+        until: prometheus_running is success
+        retries: 10
+        tags:
+          - prometheus
+
+      when: not prometheus_state.exists
+
+    # - name: Add Prometheus container to inventory
+    #   add_host:
+    #     name: "{{ prometheus_container_name }}"
+    #     ansible_connection: community.docker.docker
+    #   changed_when: false
+
+    # - name: run command in container
+    #   delegate_to: "{{ prometheus_container_name }}"
+    #   copy:
+    #     src: files/prometheus/prometheus.yml
+    #     dest: /etc/prometheus/prometheus.yml
+
+    - name: Copy configuration file into Prometheus container
+      ansible.builtin.shell: docker cp files/prometheus/prometheus.yml {{ prometheus_container_name }}:/etc/prometheus/prometheus.yml
+
+    # - name: Restart Prometheus
+    #   community.docker.docker_container_exec:
+    #     container: "{{ prometheus_container_name }}"
+    #     command: /bin/sh -c "/bin/prometheus --config.file=/etc/prometheus/prometheus.yml"
+    #   register: result
+
+      # curl -X POST :9090/-/reload
+    - name: Restart Prometheus via curl
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}:9090/-/reload"
+        method: POST
+        # body: "{{ lookup('ansible.builtin.file','issue.json') }}"
+
+    # ####### LOKI SECTION
+
+    # # Source: https://grafana.com/docs/loki/latest/installation/docker/
+
+    # - name: Set loki facts
+    #   ansible.builtin.set_fact:
+    #     loki_image_name: grafana/loki
+    #     loki_image_tag: 2.5.2
+    #     loki_container_name: loki
+    #     loki_container_port: 3100
+    #     loki_volume: loki-data
+    #   tags:
+    #     - loki
+    #     - stable
+
+    # - name: Pull image
+    #   community.docker.docker_image:
+    #     name: "{{ loki_image_name }}:{{ loki_image_tag | default('latest') }}"
+    #     source: pull
+    #   tags:
+    #     - loki
+    #     - stable
+
+    # - name: Define configuration directory
+    #   ansible.builtin.set_fact:
+    #     loki_config_dir: "{{ ansible_user_registered.home }}/loki"
+    #   tags:
+    #     - loki
+    #     - stable
+
+    # - name: Create configuration directory
+    #   ansible.builtin.file:
+    #     path: "{{ loki_config_dir }}"
+    #     state: directory
+    #     mode: '0755'
+    #   tags:
+    #     - loki
+    #     - stable
+
+    # - name: Get configuration file
+    #   ansible.builtin.get_url:
+    #     url: https://raw.githubusercontent.com/grafana/loki/v2.5.0/cmd/loki/loki-local-config.yaml
+    #     dest: "{{ loki_config_dir }}/loki-config.yaml"
+    #     mode: '0440'
+    #   tags:
+    #     - loki
+    #     - stable
+
+    # - name: Run loki
+    #   community.docker.docker_container:
+    #     image: "{{ loki_image_name }}:{{ loki_image_tag | default('latest') }}"
+    #     name: "{{ loki_container_name }}"
+    #     command: --config.file=/mnt/config/loki-config.yaml
+    #     detach: true
+    #     dns_servers:
+    #       - "{{ consul_dns_host | default(ansible_host) }}"
+    #       - "{{ lan_dns_host | default('192.168.1.1') }}"
+    #     dns_search_domains:
+    #       - "{{ consul_dns_domain | default('service.dc1.consul') }}"
+    #       - "{{ lan_dns_domain | default('localdomain') }}"
+    #     env:
+    #       CONSUL_HTTP_ADDR: "{{ host_address }}:8500"
+    #       CONSUL_RPC_ADDR: "{{ host_address }}:8400"
+    #     labels:
+    #       traefik.enable: "true"
+    #       traefik.http.services.loki.loadbalancer.server.port: "3100"
+    #       traefik.http.routers.loki.rule: Host(`loki`)
+    #     published_ports:
+    #       - "{{ loki_container_port }}:3100"
+    #     restart: true
+    #     restart_policy: unless-stopped
+    #     state: started
+    #     user: "{{ ansible_user_uid }}:{{ ansible_user_gid }}"
+    #     volumes:
+    #       - "{{ loki_config_dir }}:/mnt/config"
+    #       - /etc/localtime:/etc/localtime:ro
+    #   tags:
+    #     - loki
+    #     - stable
+
+    # - name: Wait for loki to start
+    #   ansible.builtin.wait_for:
+    #     host: "{{ host_address }}"
+    #     port: "{{ loki_container_port }}"
+    #     delay: 10
+    #     state: started
+    #   tags:
+    #     - loki
+    #     - stable
+
+    # - name: Register loki service with the consul agent
+    #   community.general.consul:
+    #     service_name: "{{ loki_container_name }}"
+    #     service_port: "{{ loki_container_port }}"
+    #     host: "{{ host_address }}"
+    #   when: consul_service_running
+    #   tags:
+    #     - loki
+    #     - stable
+
+    # ####### PROMTAIL SECTION
+
+    # # Source: https://grafana.com/docs/loki/latest/installation/docker/
+
+    # - name: Set promtail facts
+    #   ansible.builtin.set_fact:
+    #     promtail_image_name: grafana/promtail
+    #     promtail_image_tag: 2.5.0
+    #     promtail_container_name: promtail
+    #   tags:
+    #     - promtail
+    #     - stable
+
+    # - name: Pull image
+    #   community.docker.docker_image:
+    #     name: "{{ promtail_image_name }}:{{ promtail_image_tag | default('latest') }}"
+    #     source: pull
+    #   tags:
+    #     - promtail
+    #     - stable
+
+    # - name: Define configuration directory
+    #   ansible.builtin.set_fact:
+    #     promtail_config_dir: "{{ ansible_user_registered.home }}/promtail"
+    #   tags:
+    #     - promtail
+    #     - stable
+
+    # - name: Create configuration directory
+    #   ansible.builtin.file:
+    #     path: "{{ promtail_config_dir }}"
+    #     state: directory
+    #     mode: '0755'
+    #   tags:
+    #     - promtail
+    #     - stable
+
+    # - name: Get promtail-docker configuration file
+    #   ansible.builtin.get_url:
+    #     url: https://raw.githubusercontent.com/grafana/loki/v2.5.0/clients/cmd/promtail/promtail-docker-config.yaml
+    #     dest: "{{ promtail_config_dir }}/promtail-config.yaml"
+    #     mode: '0755'
+    #   tags:
+    #     - promtail
+    #     - stable
+
+    # - name: Run promtail
+    #   community.docker.docker_container:
+    #     image: "{{ promtail_image_name }}:{{ promtail_image_tag | default('latest') }}"
+    #     name: "{{ promtail_container_name }}"
+    #     command: --config.file=/mnt/config/promtail-config.yaml
+    #     detach: true
+    #     dns_servers:
+    #       - "{{ consul_dns_host | default(ansible_host) }}"
+    #       - "{{ lan_dns_host | default('192.168.1.1') }}"
+    #     dns_search_domains:
+    #       - "{{ consul_dns_domain | default('service.dc1.consul') }}"
+    #       - "{{ lan_dns_domain | default('localdomain') }}"
+    #     env:
+    #       CONSUL_HTTP_ADDR: "{{ host_address }}:8500"
+    #       CONSUL_RPC_ADDR: "{{ host_address }}:8400"
+    #     links:
+    #       - "loki:loki"
+    #     restart: true
+    #     restart_policy: unless-stopped
+    #     state: started
+    #     # user: "{{ ansible_user_uid }}:{{ ansible_user_gid }}"
+    #     volumes:
+    #       - "{{ promtail_config_dir }}:/mnt/config"
+    #       - /var/log:/var/log
+    #       - /etc/localtime:/etc/localtime:ro
+    #   tags:
+    #     - promtail
+    #     - stable
+
+    ####### GRAFANA SECTION
+
+    - name: Set Grafana facts
+      ansible.builtin.set_fact:
+        grafana_image_name: grafana/grafana
+        grafana_image_tag: latest
+        grafana_container_name: grafana
+        grafana_container_port: 3000
+        grafana_volume: grafana-volume
+      tags:
+        - grafana
+
+    - name: Set Grafana facts
+      ansible.builtin.set_fact:
+        grafana_instance: grafana
+        grafana_api_url: "http://{{ ansible_default_ipv4.address }}:{{ grafana_container_port }}"
+        grafana_security: {admin_user: admin, admin_password: "monitoring"}
+        grafana_use_provisioning: false  # will use API
+      tags:
+        - grafana
+
+    - name: Create Grafana volume
+      community.docker.docker_volume:
+        name: "{{ grafana_volume }}"
+        state: present
+      tags:
+        - grafana
+
+    - name: Check if Grafana is running
+      community.docker.docker_container_info:
+        name: "{{ grafana_container_name }}"
+      register: grafana_state
+
+    - block:
+
+      - name: Pull Grafana image
+        community.docker.docker_image:
+          name: "{{ grafana_image_name }}:{{ grafana_image_tag | default('latest') }}"
+          source: pull
+        tags:
+          - grafana
+
+      # docker run -d -p 3000:3000 grafana/grafana
+      - name: Start Grafana
+        community.docker.docker_container:
+          name: "{{ grafana_container_name }}"
+          image: "{{ grafana_image_name }}:{{ grafana_image_tag | default('latest') }}"
+          detach: true
+          env:
+            GF_SECURITY_ADMIN_PASSWORD: "{{ grafana_security.admin_password }}"
+            GF_USERS_ALLOW_SIGN_UP: "false"
+          networks_cli_compatible: true
+          networks:
+            - name: "{{ monitoring_network_name }}"
+          published_ports:
+            - "{{ grafana_container_port }}:3000"
+          restart: true
+          restart_policy: unless-stopped
+          state: started
+          # user: "{{ ansible_user_uid }}:{{ ansible_user_gid }}"
+          volumes:
+            - "{{ grafana_volume }}:/var/lib/grafana"
+            - /etc/localtime:/etc/localtime:ro
+        register: grafana_register
+        tags:
+          - grafana
+
+      - name: Wait for Grafana to accept connections
+        ansible.builtin.wait_for:
+          # host: "{{ grafana_register['container']\
+          #   ['NetworkSettings']\
+          #   ['Networks']\
+          #   ['monitoring-network']\
+          #   ['IPAddress'] }}"
+          host: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
+          port: "{{ grafana_container_port | default('3000') }}"
+          connect_timeout: 1
+          delay: 10
+          state: started
+          timeout: 30
+        register: grafana_running
+        until: grafana_running is success
+        retries: 10
+        tags:
+          - grafana
+
+      when: not grafana_state.exists
+
+    - name: Create Grafana datasources
+      community.grafana.grafana_datasource:
+        name: "{{ item.name }}"
+        grafana_url: "{{ grafana_api_url }}"
+        grafana_user: "{{ grafana_security.admin_user }}"
+        grafana_password: "{{ grafana_security.admin_password }}"
+        org_id: "1"
+        ds_type: "{{ item.type }}"
+        ds_url: "{{ item.url }}"
+        access: "{{ item.access }}"
+        tls_skip_verify: true
+        # additional_json_data:
+        #   httpHeaderName1: "Authorization"
+        # additional_secure_json_data:
+        #   httpHeaderValue1: "Bearer ihavenogroot"
+      with_items: "{{ grafana_datasources }}"
+      vars:
+        grafana_datasources:
+          - name: Prometheus
+            type: prometheus
+            access: proxy
+            url: "http://{{ prometheus_container_name }}:{{ prometheus_container_port }}"
+            basicAuth: false
+          # - name: Loki
+          #   type: loki
+          #   access: proxy
+          #   url: "http://192.168.1.186:3100/"
+          #   basicAuth: false
+          # - name: InfluxDB
+          #   type: influxdb
+          #   access: proxy
+          #   url: "http://192.168.1.186:8086/"
+          #   basicAuth: false
+      tags:
+        - grafana
+
+    - name: Create Grafana dashboards
+      community.grafana.grafana_dashboard:
+        grafana_url: "{{ grafana_api_url }}"
+        # grafana_api_key: "{{ grafana_api_key }}"
+        grafana_user: "{{ grafana_security.admin_user }}"
+        grafana_password: "{{ grafana_security.admin_password }}"
+        # folder: General
+        dashboard_url: "https://grafana.com/api/dashboards/{{ item.dashboard_id }}/revisions/{{ item.dashboard_revision }}/download"
+      vars:
+        grafana_dashboards:
+          # - dashboard_id: '13584'
+          #   dashboard_revision: '1'
+          #   datasource: 'Prometheus'
+          # # DockProm Docker Containers dashboard with support for multiple instance
+          # # https://grafana.com/grafana/dashboards/14479
+          # - dashboard_id: '14479'
+          #   dashboard_revision: '1'
+          #   datasource: 'Prometheus'
+          # # Docker and system monitoring by kulab45
+          # # https://grafana.com/grafana/dashboards/13496
+          # # - dashboard_id: '13496'
+          # #   dashboard_revision: '1'
+          # #   datasource: 'Prometheus'
+          # # Docker Environment Monitoring
+          # # https://grafana.com/grafana/dashboards/12792
+          # - dashboard_id: '12792'
+          #   dashboard_revision: '2'
+          #   datasource: 'Prometheus'
+          # # # Docker and OS metrics ( cadvisor, node_exporter) by Bernardo Martinez
+          # # # https://grafana.com/grafana/dashboards/10566
+          # # - dashboard_id: '10566'
+          # #   dashboard_revision: '1'
+          # #   datasource: 'Prometheus'
+          # Node Exporter Full by rfraile
+          # https://grafana.com/grafana/dashboards/1860
+          - dashboard_id: '1860'
+            dashboard_revision: '27'
+            datasource: 'Prometheus'
+      with_items: "{{ grafana_dashboards }}"
+      tags:
+        - grafana
+        - stable
