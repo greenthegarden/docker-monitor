@@ -377,7 +377,7 @@
 
     - name: Set Grafana facts
       ansible.builtin.set_fact:
-        grafana_instance: grafana
+        grafana_instance: "{{ grafana_container_name | default('grafana') }}"
         grafana_api_url: "http://{{ ansible_default_ipv4.address }}:{{ grafana_container_port }}"
         grafana_security: {admin_user: admin, admin_password: "monitoring"}
         grafana_use_provisioning: false  # will use API
@@ -426,7 +426,6 @@
           restart: true
           restart_policy: unless-stopped
           state: started
-          # user: "{{ ansible_user_uid }}:{{ ansible_user_gid }}"
           volumes:
             - "{{ grafana_volume }}:/var/lib/grafana"
             - /etc/localtime:/etc/localtime:ro
