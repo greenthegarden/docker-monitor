@@ -13,7 +13,7 @@ scrape_configs:
     scrape_interval: 30s
     scheme: http
     static_configs:
-      - targets: ['http://localhost:3001']
+      - targets: ['localhost:3001']
     basic_auth: # Only needed if authentication is enabled (default) 
       username: homelab
       password: "vowel-liable-treason"
