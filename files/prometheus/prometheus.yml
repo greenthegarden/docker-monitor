@@ -13,8 +13,18 @@ scrape_configs:
     scrape_interval: 30s
     scheme: http
     static_configs:
-      - targets: ['localhost:3001']
+      - targets: ['172.27.165.216:3001']
     basic_auth: # Only needed if authentication is enabled (default) 
       username: homelab
       password: "vowel-liable-treason"
-      
+  # https://www.home-assistant.io/integrations/prometheus/
+  # Example Prometheus scrape_configs entry (For version 2.26+)
+  - job_name: "hass"
+    scrape_interval: 60s
+    metrics_path: /api/prometheus
+    # Long-Lived Access Token
+    authorization:
+      credentials: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiI2NmEzZTYyOWQwY2Y0NDU0OGM1ZWY3MDdjNjk1MDUzZSIsImlhdCI6MTY1ODQwNzAxNSwiZXhwIjoxOTczNzY3MDE1fQ.G_Qb_D4eipqKz_5vzX6r5OE9cMAeoaeyIB64eYP5M4E"
+    scheme: http
+    static_configs:
+      - targets: ['172.27.165.216:8123']
