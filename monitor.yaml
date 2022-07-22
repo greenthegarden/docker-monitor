@@ -39,16 +39,13 @@
 
     ####### MONITORING NETWORK SECTION
 
-    # Based on
-    # https://community.home-assistant.io/t/how-to-run-homeassistant-on-docker-on-its-own-network-instead-of-the-host-network/189315/4
-
     - name: Set Monitoring Network facts
       ansible.builtin.set_fact:
         monitoring_network_name: monitoring-network
 
     - name: Create a Monitoring Network
       community.docker.docker_network:
-        name: "{{ monitoring_network_name | default('monitoring_network') }}"
+        name: "{{ monitoring_network_name | default('monitoring-network') }}"
         internal: false
     
     ####### NODE EXPORTER SECTION
@@ -260,6 +257,65 @@
           - promtail
 
       when: not promtail_state.exists
+
+    ####### PUSHGATEWAY SECTION
+
+    - name: Set Pushgateway facts
+      ansible.builtin.set_fact:
+        pushgateway_image_name: prom/pushgateway
+        pushgateway_image_tag: 'latest' # 'v1.4.2'
+        pushgateway_container_name: pushgateway
+        pushgateway_container_port: 9091
+      tags:
+        - pushgateway
+
+    - name: Check if Pushgateway is running
+      community.docker.docker_container_info:
+        name: "{{ pushgateway_container_name }}"
+      register: pushgateway_state
+      tags:
+        - pushgateway
+
+    - block:
+
+      - name: Pull Pushgateway image
+        community.docker.docker_image:
+          name: "{{ pushgateway_image_name }}:{{ pushgateway_image_tag | default('latest') }}"
+          source: pull
+        tags:
+          - pushgateway
+
+      - name: Start Pushgateway
+        community.docker.docker_container:
+          name: "{{ pushgateway_container_name | default('pushgateway') }}"
+          image: "{{ pushgateway_image_name }}:{{ pushgateway_image_tag | default('latest') }}"
+          detach: true
+          networks_cli_compatible: true
+          networks:
+            - name: "{{ monitoring_network_name }}"
+          published_ports:
+            - "{{ pushgateway_container_port | default(9091) }}:9091"
+          restart: true
+          restart_policy: unless-stopped
+          state: started
+        tags:
+          - pushgateway
+
+      - name: Wait for Pushgateway to accept connections
+        ansible.builtin.wait_for:
+          host: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
+          port: "{{ pushgateway_container_port | default(9091) }}"
+          connect_timeout: 1
+          delay: 10
+          state: started
+          timeout: 30
+        register: pushgateway_running
+        until: pushgateway_running is success
+        retries: 10
+        tags:
+          - pushgateway
+
+      when: not pushgateway_state.exists
 
     ####### PROMETHEUS SECTION
 
