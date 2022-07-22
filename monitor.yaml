@@ -336,32 +336,47 @@
 
       when: not prometheus_state.exists
 
-    - name: Add Prometheus container to inventory
-      add_host:
-        name: "{{ prometheus_container_name }}"
-        ansible_connection: community.docker.docker
-      changed_when: false
+    - block:
+      
+      - name: Add Prometheus container to inventory
+        add_host:
+          name: "{{ prometheus_container_name }}"
+          ansible_connection: community.docker.docker
+        changed_when: false
+
+      - name: run command in container
+        delegate_to: "{{ prometheus_container_name }}"
+        copy:
+          src: files/prometheus/prometheus.yml
+          dest: /etc/prometheus/prometheus.yml
+      
       when: 0
 
-    - name: run command in container
-      delegate_to: "{{ prometheus_container_name }}"
-      copy:
-        src: files/prometheus/prometheus.yml
-        dest: /etc/prometheus/prometheus.yml
-      when: 0
 
-    - name: Copy configuration file into Prometheus container
-      ansible.builtin.shell: docker cp files/prometheus/prometheus.yml {{ prometheus_container_name }}:/etc/prometheus/prometheus.yml
-      tags:
-        - prometheus
+    - block:
 
-      # curl -X POST :9090/-/reload
-    - name: Restart Prometheus via curl
-      ansible.builtin.uri:
-        url: "http://{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}:9090/-/reload"
-        method: POST
-      tags:
-        - prometheus
+      - name: Create configuration file
+        ansible.builtin.template:
+          src: templates/prometheus/prometheus.yml.j2
+          dest: /tmp/prometheus.yml
+          mode: '0644'
+        tags:
+          - prometheus
+
+      - name: Copy configuration file into Prometheus container
+        ansible.builtin.shell: docker cp /tmp/prometheus.yml {{ prometheus_container_name }}:/etc/prometheus/prometheus.yml
+        tags:
+          - prometheus
+
+        # curl -X POST :9090/-/reload
+      - name: Restart Prometheus via curl
+        ansible.builtin.uri:
+          url: "http://{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}:9090/-/reload"
+          method: POST
+        tags:
+          - prometheus
+
+      when: 1
 
     ####### GRAFANA SECTION
 
