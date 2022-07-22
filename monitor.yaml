@@ -335,6 +335,8 @@
       community.docker.docker_container_info:
         name: "{{ prometheus_container_name }}"
       register: prometheus_state
+      tags:
+        - prometheus
       
     - block:
 
@@ -379,7 +381,7 @@
           #   ['monitoring-network']\
           #   ['IPAddress'] }}"
           host: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
-          port: "{{ prometheus_container_port | default('9090') }}"
+          port: "{{ prometheus_container_port | default(9090) }}"
           connect_timeout: 1
           delay: 10
           state: started
