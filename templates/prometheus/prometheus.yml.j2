@@ -38,3 +38,14 @@ scrape_configs:
     scrape_interval: 90s
     static_configs:
       - targets: ['{{ ansible_default_ipv4.address }}:9205']
+  # https://www.vaultproject.io/docs/configuration/telemetry
+  - job_name: 'vault'
+    metrics_path: "/v1/sys/metrics"
+    params:
+      format: ['prometheus']
+    scheme: https
+    # tls_config:
+    #   ca_file: your_ca_here.pem
+    #bearer_token: "your_vault_token_here"
+    static_configs:
+    - targets: ['{{ ansible_default_ipv4.address }}:8200']
